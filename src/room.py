@@ -1,25 +1,11 @@
 """
-room.py — imperative scene builder for the acoustic room.
+room.py — builds the (NY, NX) alpha material map the solver consumes (0 = air, >0 = obstacle).
 
-Produces the (NY, NX) material map (the "alpha-map") that the FDTD solver consumes:
-    alpha[row, col] == 0.0   ->  air  (the wave propagates freely)
-    alpha[row, col]  > 0.0   ->  obstacle (wall / furniture) with that ABSORPTION
-                                 coefficient α; the solver reflects with R_p = √(1-α).
-
-All geometry is given in METRES and converted to cell indices via utils.coord_to_cell
-(which clamps to the grid).  Builders return self, so calls chain:
-
-    room = (Room(grid)
-            .add_border("Concrete")                       # closed outer shell
-            .add_rectangle("Wood", 4.0, 0.0, 4.15, 6.0)   # interior partition
-            .add_doorway(4.0, 2.5, 4.15, 3.5)             # gap in that partition
-            .add_block("Carpet", 1.0, 1.0, 2.5, 2.0))     # absorbing furniture
-
-This module is a sibling of physics_solver.py: both build only on config/grid/utils
-and never import each other.  The solver receives `room.alpha`, not the Room object.
-
-NOTE: a perfectly rigid obstacle is α≈0 (e.g. Concrete 0.02 → R_p≈0.99).  Exactly
-α=0 means "air", so it is NOT an obstacle — use a small α for a hard wall.
+Geometry is given in metres.  Builders chain, and each registers a selectable *piece*
+(stamped into a parallel piece_id map) so a frontend can recolour (set_material /
+set_wall_material), build (add_rectangle / add_block), carve (add_doorway), or delete
+(remove_piece) pieces; the outer shell is protected.  After any edit call
+solver.set_alpha(room.alpha).  Use a small alpha for a hard wall — exactly 0 means air.
 """
 
 import numpy as np
@@ -30,10 +16,7 @@ from config import MATERIALS
 
 
 def _alpha_value(material) -> float:
-    """Resolve a material spec to an absorption coefficient α.
-
-    Accepts a preset name ("Wood") or a raw float α in [0, 1].
-    """
+    """Resolve a material spec (preset name or raw float alpha in [0, 1]) to its alpha."""
     if isinstance(material, str):
         return MATERIALS[material]
     a = float(material)
@@ -42,97 +25,143 @@ def _alpha_value(material) -> float:
     return a
 
 
+class Piece:
+    """A named, recolourable obstacle (a wall or a piece of furniture)."""
+    __slots__ = ("name", "material", "kind", "protected")
+
+    def __init__(self, name, material, kind="wall", protected=False):
+        self.name = name
+        self.material = material      # preset name (str) or raw float alpha
+        self.kind = kind              # "wall" | "furniture"
+        self.protected = protected    # protected pieces (the outer shell) can't be deleted
+
+    @property
+    def alpha(self) -> float:
+        return _alpha_value(self.material)
+
+    def label(self) -> str:
+        m = self.material if isinstance(self.material, str) else f"a={self.material:.2f}"
+        return f"{self.name} ({m})"
+
+
 class Room:
     """A mutable (NY, NX) absorption map you stamp walls and furniture into."""
 
     def __init__(self, grid: RoomGrid):
         self.grid = grid
-        self.alpha = empty_field(grid)          # all air (0.0) to start
+        self.alpha = empty_field(grid)                                   # 0.0 = air
+        self.piece_id = np.full((grid.NY, grid.NX), -1, dtype=np.int32)  # -1 = air
+        self.pieces: list[Piece] = []                                    # index == piece id
+        self.locked = np.zeros((grid.NY, grid.NX), dtype=bool)           # protected cells
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _cell_box(self, x0, y0, x1, y1):
-        """Metre rectangle -> inclusive (row0, row1, col0, col1) cell-index box."""
         r0, c0 = coord_to_cell(min(x0, x1), min(y0, y1), self.grid)
         r1, c1 = coord_to_cell(max(x0, x1), max(y0, y1), self.grid)
         return r0, r1, c0, c1
 
-    # ── builders ─────────────────────────────────────────────────────────────
-    def add_rectangle(self, material, x0, y0, x1, y1):
-        """Fill a metre rectangle with an obstacle material (wall or furniture)."""
-        a = _alpha_value(material)
+    def _rect_mask(self, x0, y0, x1, y1) -> np.ndarray:
         r0, r1, c0, c1 = self._cell_box(x0, y0, x1, y1)
-        self.alpha[r0:r1 + 1, c0:c1 + 1] = a
+        m = np.zeros_like(self.piece_id, dtype=bool)
+        m[r0:r1 + 1, c0:c1 + 1] = True
+        return m
+
+    def _stamp(self, name, material, mask, kind="wall", protected=False) -> int:
+        """Register a piece over mask.  Protected (shell) cells are never overwritten,
+        so building near the edge can't 'steal' the outer walls."""
+        if not protected:
+            mask = mask & ~self.locked
+        idx = len(self.pieces)
+        self.pieces.append(Piece(name, material, kind, protected))
+        self.alpha[mask] = _alpha_value(material)
+        self.piece_id[mask] = idx
+        if protected:
+            self.locked |= mask
+        return idx
+
+    # ── builders ─────────────────────────────────────────────────────────────
+    def add_rectangle(self, material, x0, y0, x1, y1, name=None, kind="wall", protected=False):
+        """Fill a metre rectangle with an obstacle material (a wall by default)."""
+        self._stamp(name or f"{kind} {len(self.pieces)}", material,
+                    self._rect_mask(x0, y0, x1, y1), kind=kind, protected=protected)
         return self
 
-    # furniture reads more naturally as "a block"; same operation
-    add_block = add_rectangle
+    def add_block(self, material, x0, y0, x1, y1, name=None):
+        """Fill a metre rectangle with FURNITURE (recoloured individually)."""
+        return self.add_rectangle(material, x0, y0, x1, y1, name=name, kind="furniture")
 
-    def add_border(self, material, thickness: int = 1):
-        """Stamp the outer frame (closed room).  `thickness` is in cells (>= 1)."""
-        a = _alpha_value(material)
+    def add_border(self, material, thickness: int = 1, name="border"):
+        """Stamp the protected outer frame (closed room).  thickness is in cells (>= 1)."""
         t = max(1, int(thickness))
-        self.alpha[:t, :]  = a   # South edge (y = 0)
-        self.alpha[-t:, :] = a   # North edge
-        self.alpha[:, :t]  = a   # West edge  (x = 0)
-        self.alpha[:, -t:] = a   # East edge
+        m = np.zeros_like(self.piece_id, dtype=bool)
+        m[:t, :] = True
+        m[-t:, :] = True
+        m[:, :t] = True
+        m[:, -t:] = True
+        self._stamp(name, material, m, kind="wall", protected=True)
         return self
 
     def carve(self, x0, y0, x1, y1):
-        """Reset a metre rectangle back to air (α = 0) — e.g. a doorway gap."""
-        r0, r1, c0, c1 = self._cell_box(x0, y0, x1, y1)
-        self.alpha[r0:r1 + 1, c0:c1 + 1] = 0.0
+        """Reset a metre rectangle back to air — e.g. a doorway gap.  Shell cells stay intact."""
+        m = self._rect_mask(x0, y0, x1, y1) & ~self.locked
+        self.alpha[m] = 0.0
+        self.piece_id[m] = -1
         return self
 
-    # a doorway is simply a carved gap in a wall
     add_doorway = carve
 
-    # ── views ────────────────────────────────────────────────────────────────
+    # ── editing ────────────────────────────────────────────────────────────────
+    def piece_at(self, row, col):
+        """Piece id at a cell, or None if it is air / out of bounds."""
+        if not (0 <= row < self.grid.NY and 0 <= col < self.grid.NX):
+            return None
+        idx = int(self.piece_id[row, col])
+        return idx if idx >= 0 else None
+
+    def set_material(self, idx, material):
+        """Recolour a single piece."""
+        if 0 <= idx < len(self.pieces):
+            self.pieces[idx].material = material
+            self.alpha[self.piece_id == idx] = _alpha_value(material)
+        return self
+
+    def set_wall_material(self, material):
+        """Recolour every wall-kind piece at once (walls behave as one group)."""
+        a = _alpha_value(material)
+        for idx, p in enumerate(self.pieces):
+            if p.kind == "wall":
+                p.material = material
+                self.alpha[self.piece_id == idx] = a
+        return self
+
+    def remove_piece(self, idx):
+        """Delete a piece (cells return to air).  Protected pieces are kept; ids stay stable."""
+        if 0 <= idx < len(self.pieces) and not self.pieces[idx].protected:
+            mask = self.piece_id == idx
+            self.alpha[mask] = 0.0
+            self.piece_id[mask] = -1
+        return self
+
+    # ── undo support ─────────────────────────────────────────────────────────
+    def snapshot(self):
+        return (self.alpha.copy(), self.piece_id.copy(), self.locked.copy(),
+                [(p.name, p.material, p.kind, p.protected) for p in self.pieces])
+
+    def restore(self, snap):
+        a, pid, lk, pcs = snap
+        self.alpha[...] = a
+        self.piece_id[...] = pid
+        self.locked[...] = lk
+        self.pieces = [Piece(n, m, k, pr) for (n, m, k, pr) in pcs]
+        return self
+
+    # ── views ──────────────────────────────────────────────────────────────────
     @property
     def is_solid(self) -> np.ndarray:
-        """Boolean (NY, NX) mask: True wherever there is an obstacle."""
         return self.alpha > 0.0
 
     def summary(self) -> str:
         solid = int(self.is_solid.sum())
-        present = sorted({round(float(v), 3) for v in np.unique(self.alpha) if v > 0})
+        live = sum(1 for i in range(len(self.pieces)) if np.any(self.piece_id == i))
         return (f"Room {self.grid.NX} x {self.grid.NY} cells | "
-                f"{solid} solid ({100 * solid / self.alpha.size:.1f}%) | "
-                f"alpha present: {present}")
-
-
-if __name__ == "__main__":
-    import sys
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-
-    grid = RoomGrid()
-
-    # Two-room layout: concrete shell, a wooden partition at x≈4 m with a 1 m
-    # doorway, and an absorbing furniture block (a sofa) in the left room.
-    room = (Room(grid)
-            .add_border("Concrete")
-            .add_rectangle("Wood", 4.0, 0.0, 4.15, 6.0)   # partition wall
-            .add_doorway(4.0, 2.5, 4.15, 3.5)             # doorway gap
-            .add_block("Carpet", 1.0, 1.0, 2.5, 2.0))     # soft furniture (sofa)
-
-    print(room.summary())
-    print()
-
-    # Spot-checks (verification: builders stamp the expected α) -----------------
-    checks = [
-        ("partition (x=4.07,y=5.0)", (4.07, 5.0), 0.15, "Wood"),
-        ("doorway   (x=4.07,y=3.0)", (4.07, 3.0), 0.00, "air"),
-        ("furniture (x=1.5, y=1.5)", (1.5, 1.5),  0.40, "Carpet"),
-        ("open air  (x=6.0, y=5.0)", (6.0, 5.0),  0.00, "air"),
-    ]
-    ok = True
-    for label, (x, y), expect, name in checks:
-        r, c = coord_to_cell(x, y, grid)
-        got = float(room.alpha[r, c])
-        match = abs(got - expect) < 1e-9
-        ok = ok and match
-        print(f"  {label}: alpha={got:.2f}  expect {expect:.2f} ({name})  "
-              f"{'OK' if match else 'MISMATCH'}")
-    print(f"  border    (row 0)        : alpha={float(room.alpha[0, 60]):.2f}  "
-          f"expect 0.02 (Concrete)")
-    print("\nPASS" if ok else "\nFAIL")
+                f"{solid} solid ({100 * solid / self.alpha.size:.1f}%) | {live} pieces")
