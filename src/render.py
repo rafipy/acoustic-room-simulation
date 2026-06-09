@@ -52,6 +52,43 @@ def to_surface(rgb):
     return pygame.surfarray.make_surface(arr)
 
 
+def draw_pressure_legend(surface, rect, font, p_scale, *, gamma=0.6, tick_formatter=None,
+                         axis=(200, 200, 200), label=(120, 120, 140)):
+    """Draw the red compression scale used by field_to_rgb.
+
+    The tick labels are pressure values: 0, half scale, and full scale.
+    """
+    x, y, w, h = rect
+    if w <= 0 or h <= 0:
+        return
+    denom = max(w - 1, 1)
+    for i in range(w):
+        frac = i / denom
+        pos = frac ** gamma
+        gb = int(np.clip(round(255.0 * (1.0 - pos)), 0, 255))
+        pygame.draw.line(surface, (255, gb, gb), (x + i, y), (x + i, y + h - 1))
+    pygame.draw.rect(surface, axis, rect, 1)
+
+    if font is None:
+        return
+    if tick_formatter is None:
+        tick_formatter = lambda pa: f"{pa:.2g}"
+    ticks = ((0.0, tick_formatter(0.0)),
+             (0.5, tick_formatter(0.5 * p_scale)),
+             (1.0, tick_formatter(p_scale)))
+    for frac, text in ticks:
+        tx = x + int(round((w - 1) * frac))
+        lab = font.render(text, True, label)
+        lr = lab.get_rect(midtop=(tx, y + h + 2))
+        if frac == 0.0:
+            lr.left = x
+        elif frac == 1.0:
+            lr.right = x + w
+        else:
+            lr.centerx = tx
+        surface.blit(lab, lr)
+
+
 def draw_line_chart(surface, rect, values, *, times=None, font=None,
                     color=(28, 28, 28), bg=(255, 255, 255), axis=(200, 200, 200),
                     label=(120, 120, 140), y_max=None):
